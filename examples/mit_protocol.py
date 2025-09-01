@@ -1,75 +1,89 @@
 #!/usr/bin/env python3
 """
-MIT protocol example for RobStride Motor SDK
+MIT Protocol Example for RobStride Motor SDK
+
+This example demonstrates how to use the RobStride motor with MIT protocol.
+When initializing with MIT protocol, the motor will automatically be set to MIT mode.
 """
 
 import time
+import logging
 from robstride import RobStrideMotor, ProtocolType
 
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 def main():
-    # Create motor instance with MIT protocol
+    """MIT protocol usage example"""
+    
+    # Initialize motor with MIT protocol (default)
     motor = RobStrideMotor(
-        can_id=1,                      # Motor CAN ID
-        interface='can0',              # CAN interface
-        protocol=ProtocolType.MIT,     # Use MIT protocol
-        timeout=1.0
+        can_id=1,
+        interface='can0',
+        protocol=ProtocolType.MIT  # This will automatically set the motor to MIT mode
     )
     
     try:
-        # Connect to motor
-        print("Connecting to motor (MIT protocol)...")
+        # Connect to motor (this will automatically set MIT protocol)
+        logger.info("Connecting to motor with MIT protocol...")
         motor.connect()
         
         # Enable motor
-        print("Enabling motor...")
+        logger.info("Enabling motor...")
         motor.enable()
+        time.sleep(0.1)
         
         # Set zero position
-        print("Setting zero position...")
+        logger.info("Setting zero position...")
         motor.set_zero_position()
-        time.sleep(0.5)
+        time.sleep(0.1)
         
-        # MIT motion control
-        print("MIT motion control example...")
-        motor.set_motion_control(
-            position=1.0,    # 1 radian
-            velocity=0.0,    # Hold position
-            kp=50.0,         # Position gain
-            kd=2.0,          # Velocity gain  
-            torque=0.0       # No feed-forward torque
-        )
+        # MIT protocol motion control examples
+        logger.info("MIT Motion Control Examples:")
         
-        # Monitor status
-        print("Monitoring...")
-        for i in range(50):  # 5 seconds
-            print(f"Pos: {motor.position:.3f} rad, "
-                  f"Vel: {motor.velocity:.3f} rad/s, "
-                  f"Torque: {motor.torque:.3f} Nm, "
-                  f"Temp: {motor.temperature:.1f}°C")
-            time.sleep(0.1)
-        
-        # Position control with MIT protocol
-        print("MIT position control...")
-        motor.set_position_control(position=2.0, speed_limit=5.0)
-        time.sleep(3.0)
-        
-        # Velocity control with MIT protocol
-        print("MIT velocity control...")
-        motor.set_velocity_control(velocity=2.0, current_limit=8.0)
+        # Example 1: Position control with MIT protocol
+        logger.info("1. Position control (target: 1.0 rad)")
+        motor.set_position_control(position=1.0, speed_limit=5.0)
         time.sleep(2.0)
         
-        # Stop
-        motor.set_velocity_control(velocity=0.0, current_limit=8.0)
-        time.sleep(1.0)
+        # Example 2: Velocity control with MIT protocol  
+        logger.info("2. Velocity control (target: 2.0 rad/s)")
+        motor.set_velocity_control(velocity=2.0, current_limit=10.0)
+        time.sleep(2.0)
+        
+        # Example 3: Advanced motion control with all parameters
+        logger.info("3. Advanced motion control")
+        motor.set_motion_control(
+            position=0.5,    # Target position (rad)
+            velocity=1.0,    # Target velocity (rad/s)
+            kp=100.0,        # Position gain
+            kd=2.0,          # Velocity gain
+            torque=0.0       # Feed-forward torque (Nm)
+        )
+        time.sleep(2.0)
+        
+        # Return to zero
+        logger.info("4. Returning to zero position")
+        motor.set_motion_control(position=0.0, velocity=0.0, kp=50.0, kd=1.0, torque=0.0)
+        time.sleep(2.0)
+        
+        # Print motor status
+        logger.info(f"Motor Status:")
+        logger.info(f"  Position: {motor.position:.3f} rad")
+        logger.info(f"  Velocity: {motor.velocity:.3f} rad/s")
+        logger.info(f"  Torque: {motor.torque:.3f} Nm")
+        logger.info(f"  Temperature: {motor.temperature:.1f} °C")
         
     except Exception as e:
-        print(f"Error: {e}")
+        logger.error(f"Error: {e}")
         
     finally:
-        print("Disabling motor...")
+        # Always disable and disconnect
+        logger.info("Disabling motor...")
         motor.disable()
         motor.disconnect()
-        print("Done!")
+        logger.info("Example completed.")
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

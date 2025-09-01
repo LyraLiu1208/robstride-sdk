@@ -1,5 +1,13 @@
 """
-Protocol constants and enumerations for RobStride motor communication.
+Protocol constants and e    CAN_ID = 0x07                      # Communication_Type_Can_ID
+    CONTROL_MODE = 0x12                # Communication_Type_Control_Mode
+    SET_SINGLE_PARAMETER = 0x12        # Communication_Type_SetSingleParameter
+    GET_SINGLE_PARAMETER = 0x11        # Communication_Type_GetSingleParameter
+    ERROR_FEEDBACK = 0x15              # Communication_Type_ErrorFeedback
+    MOTOR_DATA_SAVE = 0x16             # Communication_Type_MotorDataSave
+    BAUD_RATE_CHANGE = 0x17            # Communication_Type_BaudRateChange
+    PROACTIVE_ESCALATION_SET = 0x18    # Communication_Type_ProactiveEscalationSet
+    MOTOR_MODE_SET = 0x19              # Communication_Type_MotorModeSet (protocol change)rations for RobStride motor communication.
 """
 
 from enum import Enum, IntEnum
