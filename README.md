@@ -1,291 +1,253 @@
-# Robstride Python SDK
+# RobStride Motor SDK
 
-A comprehensive Python SDK for controlling Robstride motors via CAN bus communication.
-
-## Overview
-
-The Robstride SDK provides a simple, powerful interface for controlling Robstride motors. It implements the complete CAN protocol specification and offers both low-level protocol access and high-level motor control functions.
+A Python SDK for controlling RobStride motors via CAN bus communication.
 
 ## Features
 
-- **Complete Protocol Implementation**: Full support for all Robstride CAN communication types
-- **Multiple Control Modes**: Motion control, position, velocity, current, and torque control
-- **Asynchronous Communication**: Background message handling with thread-safe status updates
-- **Parameter Management**: Read/write motor parameters with automatic type handling
-- **Error Handling**: Comprehensive exception system for robust applications
-- **Cross-Platform**: Works with any python-can compatible CAN interface
+- Support for both Private and MIT communication protocols
+- Comprehensive motor control modes (position, velocity, current, motion control)
+- Parameter management and configuration
+- Multi-motor support
+- Command-line interface for testing and control
+- Thread-safe CAN communication
+- Extensive error handling and validation
 
-## Quick Start
+## Installation
 
-### Installation
+### Requirements
+
+- Python 3.7+
+- python-can library
+- SocketCAN support (Linux)
+
+### Install Dependencies
 
 ```bash
 pip install python-can
 ```
 
+### Setup CAN Interface
+
+```bash
+# Setup CAN interface (example for can0)
+sudo ip link set can0 type can bitrate 1000000
+sudo ip link set can0 up
+
+# Verify interface is active
+ip link show can0
+```
+
+## Quick Start
+
 ### Basic Usage
 
 ```python
-import robstride
-import time
+from robstride import RobStrideMotor, ProtocolType
 
-# Connect to motor
-motor = robstride.create_motor_from_can_interface(
-    motor_id=1, 
-    interface='socketcan', 
-    channel='can0'
+# Create motor instance
+motor = RobStrideMotor(
+    can_id=1,                          # Motor CAN ID
+    interface='can0',                  # CAN interface
+    protocol=ProtocolType.PRIVATE      # Communication protocol
 )
+
+# Connect and control
+with motor:
+    motor.enable()
+    motor.set_position_control(position=1.0, speed_limit=5.0)
+    print(f"Position: {motor.position:.3f} rad")
+```
+
+### Command Line Interface
+
+```bash
+# Get motor information
+python robstride_cli.py --interface can0 --motor_id 1 info
 
 # Enable motor
-motor.enable()
+python robstride_cli.py --interface can0 --motor_id 1 enable
 
-# Position control - motor acts like a spring
-motor.set_motion_control(
-    pos=1.0,      # Target 1 radian
-    vel=0.0,      # No velocity target
-    kp=50.0,      # Position gain
-    kd=1.0,       # Damping
-    torque=0.0    # No feedforward torque
-)
+# Position control
+python robstride_cli.py --interface can0 --motor_id 1 position 1.5 --speed-limit 5.0
 
-# Monitor status
-time.sleep(2)
-status = motor.get_status()
-print(f"Position: {status['position']:.3f} rad")
+# Motion control
+python robstride_cli.py --interface can0 --motor_id 1 motion --position 1.0 --velocity 0.0 --kp 50.0 --kd 1.0
 
-# Clean up
-motor.disable()
-motor.close()
+# Monitor motor status
+python robstride_cli.py --interface can0 --motor_id 1 monitor
+
+# Use MIT protocol
+python robstride_cli.py --interface can0 --motor_id 1 --mit enable
 ```
+
+## Protocol Support
+
+### Private Protocol (Default)
+- Extended CAN frames (29-bit ID)
+- Full parameter access
+- All control modes supported
+- Device identification
+
+### MIT Protocol
+- Standard CAN frames (11-bit ID)
+- Motion, position, and velocity control
+- Compatible with MIT Cheetah protocol
 
 ## Control Modes
 
-### Motion Control (Default)
-The most flexible mode implementing:
-```
-torque_output = Kp*(pos_target - pos_actual) + Kd*(vel_target - vel_actual) + torque_feedforward
-```
-
-Examples:
+### Motion Control
+Direct control with position, velocity, gains, and torque:
 ```python
-# Position control (spring to 1.0 rad)
-motor.set_motion_control(pos=1.0, vel=0.0, kp=50.0, kd=1.0, torque=0.0)
-
-# Velocity control (constant 2 rad/s)  
-motor.set_motion_control(pos=0.0, vel=2.0, kp=0.0, kd=1.0, torque=0.0)
-
-# Damping mode (resist motion)
-motor.set_motion_control(pos=0.0, vel=0.0, kp=0.0, kd=2.0, torque=0.0)
-
-# Torque control (constant 1 Nm)
-motor.set_motion_control(pos=0.0, vel=0.0, kp=0.0, kd=0.0, torque=1.0)
+motor.set_motion_control(
+    position=1.0,    # Target position (rad)
+    velocity=0.0,    # Target velocity (rad/s)
+    kp=50.0,         # Position gain
+    kd=1.0,          # Velocity gain
+    torque=0.0       # Feed-forward torque (Nm)
+)
 ```
 
-### Other Control Modes
-
+### Position Control
+Position tracking with speed limit:
 ```python
-# Current control mode
-motor.set_run_mode(robstride.RUN_MODE_CURRENT)
-motor.enable()
-motor.set_current_reference(2.0)  # 2 Amps
-
-# Velocity control mode
-motor.set_run_mode(robstride.RUN_MODE_VELOCITY)
-motor.set_current_limit(5.0)      # Max 5A
-motor.enable()
-motor.set_velocity_reference(3.0)  # 3 rad/s
-
-# Position control mode (CSP)
-motor.set_run_mode(robstride.RUN_MODE_POSITION_CSP)
-motor.set_velocity_limit(10.0)     # Max 10 rad/s
-motor.set_current_limit(3.0)       # Max 3A
-motor.enable()
-motor.set_position_reference(1.5)  # 1.5 rad
+motor.set_position_control(
+    position=2.0,      # Target position (rad)
+    speed_limit=5.0    # Maximum speed (rad/s)
+)
 ```
 
-## CAN Interface Setup
-
-The SDK works with any python-can compatible interface:
-
-### SocketCAN (Linux)
-```bash
-sudo ip link set can0 type can bitrate 1000000
-sudo ip link set up can0
-```
-
+### Velocity Control
+Constant velocity with current limit:
 ```python
-motor = robstride.create_motor_from_can_interface(1, 'socketcan', 'can0')
+motor.set_velocity_control(
+    velocity=3.0,        # Target velocity (rad/s)
+    current_limit=10.0   # Current limit (A)
+)
 ```
 
-### PCAN (Windows/Linux)
+### Current Control (Private Protocol Only)
+Direct current control:
 ```python
-motor = robstride.create_motor_from_can_interface(1, 'pcan', 'PCAN_USBBUS1')
+motor.set_current_control(current=2.0)  # Target current (A)
 ```
 
-### Kvaser (Windows/Linux)
+## Parameter Management
+
+Access and modify motor parameters (Private protocol only):
 ```python
-motor = robstride.create_motor_from_can_interface(1, 'kvaser', 'kvaser://0')
+# Read parameters
+run_mode = motor.get_parameter(ParameterAddress.RUN_MODE)
+max_velocity = motor.get_parameter(ParameterAddress.MAX_VELOCITY)
+
+# Write parameters
+motor.set_parameter(ParameterAddress.LIMIT_CURRENT, 15.0)
+motor.set_parameter(ParameterAddress.MAX_VELOCITY, 20.0)
+```
+
+## Multi-Motor Control
+
+Control multiple motors simultaneously:
+```python
+motors = [
+    RobStrideMotor(can_id=1, interface='can0'),
+    RobStrideMotor(can_id=2, interface='can0'),
+    RobStrideMotor(can_id=3, interface='can0')
+]
+
+for motor in motors:
+    motor.connect()
+    motor.enable()
+    motor.set_position_control(position=1.0, speed_limit=5.0)
 ```
 
 ## Examples
 
-The `examples/` directory contains complete working examples:
+The `examples/` directory contains complete usage examples:
 
-- `01_enable_and_disable.py` - Basic motor connection and status reading
-- `02_motion_control.py` - All motion control modes with detailed demos
-- `03_read_write_params.py` - Parameter management and control mode switching
+- `basic_usage.py` - Basic motor control
+- `mit_protocol.py` - MIT protocol usage
+- `multi_motor.py` - Multi-motor coordination
+- `parameter_management.py` - Parameter access and modification
 
-Run an example:
-```bash
-cd examples
-python 01_enable_and_disable.py
-```
+## Error Handling
 
-## API Reference
-
-### Motor Class
-
-#### Basic Control
-- `enable()` - Enable motor
-- `disable(clear_errors=False)` - Disable motor
-- `set_zero_position()` - Set current position as zero
-
-#### Motion Control
-- `set_motion_control(pos, vel, kp, kd, torque)` - Unified motion control
-- `set_run_mode(mode)` - Change control mode
-- `set_current_reference(current)` - Set current target
-- `set_velocity_reference(velocity)` - Set velocity target  
-- `set_position_reference(position)` - Set position target
-
-#### Status and Diagnostics
-- `get_status(timeout=None)` - Get current motor status
-- `get_device_id(timeout=None)` - Get 64-bit device ID
-- `read_parameter(param_index, timeout=None)` - Read parameter value
-
-#### Configuration
-- `save_configuration()` - Save parameters to flash
-- `set_active_reporting(enable)` - Enable/disable status reports
-- `set_motor_id(new_id)` - Change motor CAN ID
-
-### Exception Handling
+The SDK provides comprehensive error handling:
 
 ```python
 try:
-    motor.enable()
-    motor.set_motion_control(1.0, 0.0, 50.0, 1.0, 0.0)
-    status = motor.get_status()
-except robstride.ConnectionError:
-    print("CAN communication failed")
-except robstride.TimeoutException:
+    motor.set_position_control(position=100.0)  # Invalid position
+except ValueError as e:
+    print(f"Parameter error: {e}")
+
+try:
+    motor.get_parameter(0x7005, timeout=0.5)
+except TimeoutError:
     print("Motor did not respond")
-except robstride.MotorFaultException as e:
-    print(f"Motor fault: 0x{e.fault_code:08X}")
 ```
 
-## Protocol Details
+## Testing
 
-The SDK implements the complete Robstride CAN protocol:
+Run the test suite:
+```bash
+python -m pytest tests/
+```
 
-- **Extended CAN frames** (29-bit ID) at 1Mbps
-- **ID Structure**: `[28-24: comm_type] [23-8: host_id] [7-0: motor_id]`
-- **All communication types** (0-25) from the official specification
-- **Automatic data conversion** between physical units and protocol integers
-- **Thread-safe message handling** with asynchronous status updates
+## CAN Interface Configuration
 
-## Advanced Usage
+### Supported Bitrates
+- 1000000 bps (default)
+- 500000 bps
+- 250000 bps
 
-### Custom CAN Bus Management
+### Interface Setup
+```bash
+# Set bitrate and bring up interface
+sudo ip link set can0 type can bitrate 1000000
+sudo ip link set can0 up
+
+# Monitor CAN traffic
+candump can0
+
+# Send raw CAN messages for testing
+cansend can0 03FD0100#0000000000000000  # Enable motor ID 1
+```
+
+## Troubleshooting
+
+### Common Issues
+
+1. **No response from motor**
+   - Check CAN interface is up and configured
+   - Verify motor ID and protocol mode
+   - Check physical connections
+
+2. **Permission denied on CAN interface**
+   - Run with sudo or add user to appropriate groups
+   - Check udev rules for CAN interfaces
+
+3. **Protocol mismatch**
+   - Verify motor is in correct protocol mode
+   - Try both Private and MIT protocols
+
+4. **Parameter access fails**
+   - Parameter access only available in Private protocol
+   - Check timeout values for slow responses
+
+### Debug Logging
+
+Enable debug logging for detailed information:
 ```python
-import can
-import robstride
-
-bus = can.interface.Bus(channel='can0', bustype='socketcan', bitrate=1000000)
-motor1 = robstride.Motor(motor_id=1, can_bus=bus)
-motor2 = robstride.Motor(motor_id=2, can_bus=bus)
-
-# Use motors...
-
-motor1.close()
-motor2.close()
-bus.shutdown()
+import logging
+logging.basicConfig(level=logging.DEBUG)
 ```
-
-### Status Callbacks
-```python
-def status_callback(status):
-    print(f"Motor {status['motor_id']}: pos={status['position']:.3f}")
-
-motor.set_status_callback(status_callback)
-motor.set_active_reporting(True)  # Enable 10ms status reports
-```
-
-### Parameter Access
-```python
-# Read parameter
-kp_value = motor.read_parameter(robstride.PARAM_LOC_KP)
-
-# Write parameter  
-motor.set_position_kp(30.0)
-
-# Save to flash (persists after power cycle)
-motor.save_configuration()
-```
-
-## Requirements
-
-- Python 3.7+
-- python-can >= 4.0.0
-- Compatible CAN interface hardware
 
 ## License
 
-MIT License - see LICENSE file for details.
+This SDK is provided for use with RobStride motors. Please refer to the motor documentation for warranty and support information.
 
 ## Support
 
-For technical support and documentation, visit [robstride.com](https://robstride.com)
-
-## Installation
-To install the RobStride SDK, clone the repository and install the required dependencies:
-
-```bash
-git clone https://github.com/yourusername/robstride-sdk.git
-cd robstride-sdk
-pip install -r requirements.txt
-```
-
-## Usage
-To use the RobStride SDK, import the necessary modules in your Python script:
-
-```python
-from robstride.motor import Motor
-from robstride.protocol import Protocol
-```
-
-### Example
-Here is a simple example of how to move the motor:
-
-```python
-from robstride.motor import Motor
-
-motor = Motor()
-motor.move_forward(speed=100)
-```
-
-## Examples
-The `examples` directory contains scripts demonstrating how to use the SDK:
-- `move_motor.py`: A script to control the motor's movement.
-- `read_status.py`: A script to read the motor's status.
-
-## Testing
-To run the tests, navigate to the `tests` directory and execute:
-
-```bash
-python -m unittest discover
-```
-
-## Contributing
-Contributions are welcome! Please submit a pull request or open an issue for any enhancements or bug fixes.
-
-## License
-This project is licensed under the MIT License. See the LICENSE file for details.
+For technical support and questions:
+- Check motor documentation
+- Review example code
+- Enable debug logging for troubleshooting

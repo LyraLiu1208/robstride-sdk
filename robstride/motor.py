@@ -1,460 +1,499 @@
 """
-Robstride Motor Control Class
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-This module provides the high-level Motor class for controlling Robstride motors.
-It wraps the low-level CAN protocol and provides an intuitive Python API.
+RobStride Motor control class.
 """
 
-import can
+import struct
 import time
-import threading
-from typing import Optional, Dict, Any, Callable
-from . import protocol
-from .exceptions import TimeoutException, ConnectionError, ProtocolError
+import logging
+from typing import Optional, Union
+from threading import Lock
 
+from .protocol import (
+    ProtocolType, ControlMode, CommunicationType, ParameterAddress,
+    P_MIN, P_MAX, V_MIN, V_MAX, KP_MIN, KP_MAX, KD_MIN, KD_MAX, T_MIN, T_MAX
+)
+from .utils import (
+    float_to_uint, uint16_to_float, bytes_to_float, float_to_bytes, 
+    map_faults, validate_parameter_range, clamp
+)
+from .can_interface import CANInterface
 
-class Motor:
-    """
-    High-level interface for controlling a single Robstride motor.
+logger = logging.getLogger(__name__)
+
+class RobStrideMotor:
+    """RobStride motor controller"""
     
-    This class manages the CAN communication, handles responses asynchronously,
-    and provides easy-to-use methods for all motor operations.
-    
-    Example:
-        >>> import can
-        >>> from robstride import Motor
-        >>> 
-        >>> bus = can.interface.Bus(channel='can0', bustype='socketcan', bitrate=1000000)
-        >>> motor = Motor(motor_id=1, can_bus=bus)
-        >>> 
-        >>> motor.enable()
-        >>> motor.set_motion_control(pos=1.0, vel=0.0, kp=50.0, kd=1.0, torque=0.0)
-        >>> time.sleep(2)
-        >>> status = motor.get_status()
-        >>> print(f"Position: {status['position']:.3f} rad")
-        >>> motor.disable()
-        >>> motor.close()
-    """
-    
-    def __init__(self, motor_id: int, can_bus: can.Bus, host_id: int = 0xFD, 
-                 response_timeout: float = 1.0):
+    def __init__(self, 
+                 can_id: int, 
+                 interface: str = 'can0',
+                 master_id: int = 0xFD,
+                 protocol: ProtocolType = ProtocolType.PRIVATE,
+                 timeout: float = 1.0):
         """
-        Initialize a Motor instance.
+        Initialize RobStride motor.
         
         Args:
-            motor_id: The CAN ID of the target motor (1-255)
-            can_bus: python-can Bus instance for communication
-            host_id: Host CAN ID (default: 0xFD)
-            response_timeout: Default timeout for waiting responses (seconds)
+            can_id: Motor CAN ID (1-255)
+            interface: CAN interface name (e.g., 'can0', 'can1')
+            master_id: Master controller ID (default: 0xFD)
+            protocol: Communication protocol (PRIVATE or MIT)
+            timeout: Response timeout in seconds
         """
-        self.motor_id = motor_id
-        self.host_id = host_id
-        self.bus = can_bus
-        self.response_timeout = response_timeout
+        self.can_id = can_id
+        self.master_id = master_id
+        self.protocol = protocol
+        self.timeout = timeout
         
-        # Thread-safe storage for motor status and responses
-        self._status: Optional[protocol.MotorStatus] = None
-        self._responses: Dict[int, Any] = {}  # comm_type -> response_data
-        self._status_lock = threading.RLock()
-        self._response_lock = threading.RLock()
+        # CAN interface
+        self.can_interface = CANInterface(interface)
         
-        # Setup message reception
-        self._stop_event = threading.Event()
-        self.notifier = can.Notifier(self.bus, [self._on_message_received])
+        # Motor state
+        self.position = 0.0
+        self.velocity = 0.0
+        self.torque = 0.0
+        self.temperature = 0.0
+        self.error_code = 0
+        self.run_mode = 0
+        self.unique_id = None
         
-        # Callback for status updates
-        self._status_callback: Optional[Callable[[protocol.MotorStatus], None]] = None
-    
-    def set_status_callback(self, callback: Callable[[protocol.MotorStatus], None]):
-        """
-        Set a callback function to be called whenever motor status is updated.
+        # Response handling
+        self._response_lock = Lock()
+        self._last_response = None
+        self._waiting_for_response = False
         
-        Args:
-            callback: Function that takes a MotorStatus as argument
-        """
-        self._status_callback = callback
-    
-    def _on_message_received(self, msg: can.Message):
-        """Handle incoming CAN messages from the motor."""
-        if not msg.is_extended_id:
-            return
-            
-        # Parse CAN ID
-        comm_type = (msg.arbitration_id >> 24) & 0x1F
-        data_field = (msg.arbitration_id >> 8) & 0xFFFF
-        sender_id = msg.arbitration_id & 0xFF
+        # Status
+        self._connected = False
+        self._enabled = False
         
-        # Check if this message is from our motor
-        if sender_id != self.motor_id:
-            return
-        
+    def connect(self):
+        """Connect to motor via CAN bus"""
         try:
-            if comm_type in [0x02, 0x18]:  # Motor feedback frames
-                with self._status_lock:
-                    self._status = protocol.unpack_feedback_frame(msg.arbitration_id, msg.data)
-                    
-                # Call status callback if set
-                if self._status_callback:
-                    self._status_callback(self._status)
-                    
-                # Check for faults
-                if self._status['error_code'] != 0:
-                    fault_msg = f"Motor {self.motor_id} reported fault: 0x{self._status['error_code']:02X}"
-                    # Don't raise exception here as it's in callback context
-                    # Store fault for later retrieval
-                    with self._response_lock:
-                        self._responses[0x15] = (self._status['error_code'], 0)
-                        
-            elif comm_type == 0x00:  # Device ID response
-                device_id = protocol.unpack_device_id_response(msg.data)
-                with self._response_lock:
-                    self._responses[0x00] = device_id
-                    
-            elif comm_type == 0x11:  # Parameter read response
-                index, value = protocol.unpack_read_param_response(msg.data)
-                with self._response_lock:
-                    self._responses[0x11] = (index, value)
-                    
-            elif comm_type == 0x15:  # Fault frame
-                fault, warning = protocol.unpack_fault_frame(msg.data)
-                with self._response_lock:
-                    self._responses[0x15] = (fault, warning)
-                    
+            self.can_interface.connect()
+            self.can_interface.add_message_callback(self._on_can_message)
+            self._connected = True
+            logger.info(f"Connected to motor {self.can_id} on {self.can_interface.interface_name}")
+            
+            # Get device ID to verify connection
+            self.get_device_id()
+            
         except Exception as e:
-            # Log error but don't let it crash the callback
-            print(f"Error processing message from motor {self.motor_id}: {e}")
+            logger.error(f"Failed to connect to motor {self.can_id}: {e}")
+            raise
     
-    def _send_command(self, can_id: int, data: bytes) -> None:
-        """Send a CAN command to the motor."""
-        message = can.Message(
-            arbitration_id=can_id,
-            data=data,
-            is_extended_id=True
-        )
-        try:
-            self.bus.send(message)
-        except can.CanError as e:
-            raise ConnectionError(f"Failed to send command to motor {self.motor_id}: {e}") from e
-    
-    def _wait_for_response(self, comm_type: int, timeout: Optional[float] = None) -> Any:
-        """Wait for a specific response type from the motor."""
-        if timeout is None:
-            timeout = self.response_timeout
+    def disconnect(self):
+        """Disconnect from motor"""
+        if self._connected:
+            try:
+                self.disable()
+            except:
+                pass  # Ignore errors during shutdown
             
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            with self._response_lock:
-                if comm_type in self._responses:
-                    return self._responses.pop(comm_type)
-            time.sleep(0.001)  # Small sleep to prevent busy waiting
+            self.can_interface.disconnect()
+            self._connected = False
+            logger.info(f"Disconnected from motor {self.can_id}")
+    
+    def enable(self):
+        """Enable motor"""
+        if not self._connected:
+            raise RuntimeError("Motor not connected")
+        
+        if self.protocol == ProtocolType.MIT:
+            can_id = self.can_id
+            data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC]
+            is_extended = False
+        else:
+            can_id = (CommunicationType.MOTOR_ENABLE << 24) | (self.master_id << 8) | self.can_id
+            data = [0x00] * 8
+            is_extended = True
+        
+        self._send_can_message(can_id, data, is_extended)
+        self._enabled = True
+        logger.info(f"Motor {self.can_id} enabled")
+    
+    def disable(self, clear_error: bool = False):
+        """
+        Disable motor.
+        
+        Args:
+            clear_error: Clear error flags when disabling
+        """
+        if not self._connected:
+            return
+        
+        if self.protocol == ProtocolType.MIT:
+            can_id = self.can_id
+            data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD]
+            is_extended = False
+        else:
+            can_id = (CommunicationType.MOTOR_STOP << 24) | (self.master_id << 8) | self.can_id
+            data = [int(clear_error)] + [0x00] * 7
+            is_extended = True
+        
+        self._send_can_message(can_id, data, is_extended)
+        self._enabled = False
+        logger.info(f"Motor {self.can_id} disabled")
+    
+    def set_zero_position(self):
+        """Set current position as zero"""
+        if not self._enabled:
+            raise RuntimeError("Motor not enabled")
+        
+        if self.protocol == ProtocolType.MIT:
+            can_id = self.can_id
+            data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE]
+            is_extended = False
+        else:
+            can_id = (CommunicationType.SET_POS_ZERO << 24) | (self.master_id << 8) | self.can_id
+            data = [0x01] + [0x00] * 7
+            is_extended = True
+        
+        self._send_can_message(can_id, data, is_extended)
+        logger.info(f"Set zero position for motor {self.can_id}")
+    
+    def set_motion_control(self, 
+                          position: float = 0.0,
+                          velocity: float = 0.0, 
+                          kp: float = 0.0,
+                          kd: float = 0.0,
+                          torque: float = 0.0):
+        """
+        Send motion control command.
+        
+        Args:
+            position: Target position (radians)
+            velocity: Target velocity (rad/s)
+            kp: Position gain
+            kd: Velocity gain  
+            torque: Feed-forward torque (Nm)
+        """
+        if not self._enabled:
+            raise RuntimeError("Motor not enabled")
+        
+        # Validate parameters
+        validate_parameter_range("position", position, P_MIN, P_MAX)
+        validate_parameter_range("velocity", velocity, V_MIN, V_MAX)
+        validate_parameter_range("kp", kp, KP_MIN, KP_MAX)
+        validate_parameter_range("kd", kd, KD_MIN, KD_MAX)
+        validate_parameter_range("torque", torque, T_MIN, T_MAX)
+        
+        if self.protocol == ProtocolType.MIT:
+            self._mit_motion_control(position, velocity, kp, kd, torque)
+        else:
+            self._private_motion_control(position, velocity, kp, kd, torque)
+    
+    def set_position_control(self, position: float, speed_limit: float = 5.0):
+        """
+        Set position control mode.
+        
+        Args:
+            position: Target position (radians)
+            speed_limit: Speed limit (rad/s)
+        """
+        if not self._enabled:
+            raise RuntimeError("Motor not enabled")
+        
+        validate_parameter_range("position", position, -4*3.14159, 4*3.14159)
+        validate_parameter_range("speed_limit", speed_limit, 0, 44.0)
+        
+        if self.protocol == ProtocolType.MIT:
+            can_id = (1 << 8) | self.can_id
+            data = list(struct.pack('<ff', position, speed_limit))
+            self._send_can_message(can_id, data, False)
+        else:
+            # Set to position control mode
+            self.set_parameter(ParameterAddress.RUN_MODE, ControlMode.POSITION)
+            time.sleep(0.01)
+            # Set target position
+            self.set_parameter(ParameterAddress.TARGET_POSITION, position)
+            time.sleep(0.01)
+            # Set speed limit
+            self.set_parameter(ParameterAddress.LIMIT_VELOCITY, speed_limit)
+    
+    def set_velocity_control(self, velocity: float, current_limit: float = 10.0):
+        """
+        Set velocity control mode.
+        
+        Args:
+            velocity: Target velocity (rad/s)
+            current_limit: Current limit (A)
+        """
+        if not self._enabled:
+            raise RuntimeError("Motor not enabled")
+        
+        validate_parameter_range("velocity", velocity, -30.0, 30.0)
+        validate_parameter_range("current_limit", current_limit, 0, 23.0)
+        
+        if self.protocol == ProtocolType.MIT:
+            can_id = (2 << 8) | self.can_id
+            data = list(struct.pack('<ff', velocity, current_limit))
+            self._send_can_message(can_id, data, False)
+        else:
+            # Set to velocity control mode
+            self.set_parameter(ParameterAddress.RUN_MODE, ControlMode.VELOCITY)
+            time.sleep(0.01)
+            # Set target velocity
+            self.set_parameter(ParameterAddress.TARGET_VELOCITY, velocity)
+            time.sleep(0.01)
+            # Set current limit
+            self.set_parameter(ParameterAddress.LIMIT_CURRENT, current_limit)
+    
+    def set_current_control(self, current: float):
+        """
+        Set current control mode.
+        
+        Args:
+            current: Target current (A)
+        """
+        if not self._enabled:
+            raise RuntimeError("Motor not enabled")
+        
+        validate_parameter_range("current", current, -23.0, 23.0)
+        
+        if self.protocol == ProtocolType.PRIVATE:
+            # Set to current control mode
+            self.set_parameter(ParameterAddress.RUN_MODE, ControlMode.CURRENT)
+            time.sleep(0.01)
+            # Set target current
+            self.set_parameter(ParameterAddress.TARGET_CURRENT, current)
+        else:
+            raise NotImplementedError("Current control not supported in MIT mode")
+    
+    def set_parameter(self, address: int, value: Union[int, float]):
+        """
+        Set motor parameter.
+        
+        Args:
+            address: Parameter address
+            value: Parameter value
+        """
+        if self.protocol != ProtocolType.PRIVATE:
+            raise RuntimeError("Parameter setting only supported in private protocol mode")
+        
+        can_id = (CommunicationType.SET_SINGLE_PARAMETER << 24) | (self.master_id << 8) | self.can_id
+        
+        if isinstance(value, int) and 0 <= value < 256:
+            # uint8_t parameter
+            data = [
+                address & 0xFF, (address >> 8) & 0xFF,
+                0x00, 0x00,
+                value, 0x00, 0x00, 0x00
+            ]
+        else:
+            # float parameter
+            value_bytes = float_to_bytes(float(value))
+            data = [
+                address & 0xFF, (address >> 8) & 0xFF,
+                0x00, 0x00
+            ] + value_bytes
+        
+        self._send_can_message(can_id, data, True)
+        logger.debug(f"Set parameter 0x{address:04X} = {value}")
+    
+    def get_parameter(self, address: int, timeout: Optional[float] = None) -> Union[int, float]:
+        """
+        Get motor parameter.
+        
+        Args:
+            address: Parameter address
+            timeout: Response timeout (uses default if None)
             
-        raise TimeoutException(f"No response from motor {self.motor_id} for command type 0x{comm_type:02X}")
-    
-    # ========================== Basic Motor Control ==========================
-    
-    def enable(self) -> None:
-        """
-        Enable the motor (Communication Type 3).
-        
-        After enabling, the motor will be ready to accept motion commands.
-        """
-        can_id, data = protocol.pack_enable_motor_command(self.motor_id, self.host_id)
-        self._send_command(can_id, data)
-    
-    def disable(self, clear_errors: bool = False) -> None:
-        """
-        Disable the motor (Communication Type 4).
-        
-        Args:
-            clear_errors: If True, also clear any existing motor faults
-        """
-        can_id, data = protocol.pack_disable_motor_command(self.motor_id, self.host_id, clear_errors)
-        self._send_command(can_id, data)
-    
-    def set_zero_position(self) -> None:
-        """
-        Set the current position as the new zero position (Communication Type 6).
-        
-        Note: This function is only available in CSP and Motion Control modes.
-        """
-        can_id, data = protocol.pack_set_zero_position_command(self.motor_id, self.host_id)
-        self._send_command(can_id, data)
-    
-    # ========================== Motion Control ==========================
-    
-    def set_motion_control(self, pos: float, vel: float, kp: float, kd: float, torque: float) -> None:
-        """
-        Send motion control command (Communication Type 1).
-        
-        This is the most flexible control mode, implementing:
-        torque_output = Kp * (pos_target - pos_actual) + Kd * (vel_target - vel_actual) + torque_feedforward
-        
-        Args:
-            pos: Target position in radians (-12.57 to 12.57)
-            vel: Target velocity in rad/s (-50 to 50)
-            kp: Position gain (0 to 500)
-            kd: Damping gain (0 to 5)
-            torque: Feedforward torque in Nm (-5.5 to 5.5)
-        
-        Examples:
-            # Position control (spring to position 1.0 rad)
-            motor.set_motion_control(pos=1.0, vel=0.0, kp=50.0, kd=1.0, torque=0.0)
-            
-            # Velocity control (constant 2 rad/s)
-            motor.set_motion_control(pos=0.0, vel=2.0, kp=0.0, kd=1.0, torque=0.0)
-            
-            # Damping mode (resist external motion)
-            motor.set_motion_control(pos=0.0, vel=0.0, kp=0.0, kd=2.0, torque=0.0)
-            
-            # Torque control (constant 1 Nm)
-            motor.set_motion_control(pos=0.0, vel=0.0, kp=0.0, kd=0.0, torque=1.0)
-        """
-        can_id, data = protocol.pack_motion_control_command(
-            self.motor_id, pos, vel, kp, kd, torque, self.host_id
-        )
-        self._send_command(can_id, data)
-    
-    # ========================== Parameter Control ==========================
-    
-    def set_run_mode(self, mode: int) -> None:
-        """
-        Set the motor run mode (writes parameter 0x7005).
-        
-        Args:
-            mode: Run mode
-                0: Motion control mode (default)
-                1: Position mode (PP)
-                2: Velocity mode
-                3: Current mode
-                5: Position mode (CSP)
-        
-        Note: Motor must be disabled when changing modes.
-        """
-        can_id, data = protocol.pack_write_param_command(
-            self.motor_id, protocol.PARAM_RUN_MODE, mode, self.host_id
-        )
-        self._send_command(can_id, data)
-    
-    def set_current_reference(self, current: float) -> None:
-        """
-        Set current mode Iq reference (writes parameter 0x7006).
-        
-        Args:
-            current: Target current in Amperes (-11 to 11)
-        """
-        can_id, data = protocol.pack_write_param_command(
-            self.motor_id, protocol.PARAM_IQ_REF, current, self.host_id
-        )
-        self._send_command(can_id, data)
-    
-    def set_velocity_reference(self, velocity: float) -> None:
-        """
-        Set velocity mode reference (writes parameter 0x700A).
-        
-        Args:
-            velocity: Target velocity in rad/s (-50 to 50)
-        """
-        can_id, data = protocol.pack_write_param_command(
-            self.motor_id, protocol.PARAM_SPD_REF, velocity, self.host_id
-        )
-        self._send_command(can_id, data)
-    
-    def set_position_reference(self, position: float) -> None:
-        """
-        Set position mode reference (writes parameter 0x7016).
-        
-        Args:
-            position: Target position in radians
-        """
-        can_id, data = protocol.pack_write_param_command(
-            self.motor_id, protocol.PARAM_LOC_REF, position, self.host_id
-        )
-        self._send_command(can_id, data)
-    
-    def set_velocity_limit(self, limit: float) -> None:
-        """
-        Set velocity limit for position modes (writes parameter 0x7017).
-        
-        Args:
-            limit: Maximum velocity in rad/s (0 to 50)
-        """
-        can_id, data = protocol.pack_write_param_command(
-            self.motor_id, protocol.PARAM_LIMIT_SPD, limit, self.host_id
-        )
-        self._send_command(can_id, data)
-    
-    def set_current_limit(self, limit: float) -> None:
-        """
-        Set current limit for velocity/position modes (writes parameter 0x7018).
-        
-        Args:
-            limit: Maximum current in Amperes (0 to 11)
-        """
-        can_id, data = protocol.pack_write_param_command(
-            self.motor_id, protocol.PARAM_LIMIT_CUR, limit, self.host_id
-        )
-        self._send_command(can_id, data)
-    
-    def set_position_kp(self, kp: float) -> None:
-        """Set position control Kp gain (writes parameter 0x701E)."""
-        can_id, data = protocol.pack_write_param_command(
-            self.motor_id, protocol.PARAM_LOC_KP, kp, self.host_id
-        )
-        self._send_command(can_id, data)
-    
-    def set_velocity_kp(self, kp: float) -> None:
-        """Set velocity control Kp gain (writes parameter 0x701F)."""
-        can_id, data = protocol.pack_write_param_command(
-            self.motor_id, protocol.PARAM_SPD_KP, kp, self.host_id
-        )
-        self._send_command(can_id, data)
-    
-    def set_velocity_ki(self, ki: float) -> None:
-        """Set velocity control Ki gain (writes parameter 0x7020)."""
-        can_id, data = protocol.pack_write_param_command(
-            self.motor_id, protocol.PARAM_SPD_KI, ki, self.host_id
-        )
-        self._send_command(can_id, data)
-    
-    # ========================== Status and Diagnostics ==========================
-    
-    def get_status(self, timeout: Optional[float] = None) -> protocol.MotorStatus:
-        """
-        Get the latest motor status.
-        
-        Args:
-            timeout: Maximum time to wait for fresh status (seconds)
-        
-        Returns:
-            MotorStatus dictionary with current motor state
-        
-        Raises:
-            TimeoutException: If no status is received within timeout
-        """
-        if timeout is None:
-            timeout = self.response_timeout
-            
-        start_time = time.time()
-        while time.time() - start_time < timeout:
-            with self._status_lock:
-                if self._status is not None:
-                    return self._status.copy()
-            time.sleep(0.001)
-            
-        raise TimeoutException(f"No status received from motor {self.motor_id}")
-    
-    def get_device_id(self, timeout: Optional[float] = None) -> bytes:
-        """
-        Get the motor's 64-bit unique device ID.
-        
-        Args:
-            timeout: Response timeout in seconds
-        
-        Returns:
-            8-byte device ID
-        """
-        can_id, data = protocol.pack_get_device_id_command(self.motor_id, self.host_id)
-        self._send_command(can_id, data)
-        return self._wait_for_response(0x00, timeout)
-    
-    def read_parameter(self, param_index: int, timeout: Optional[float] = None) -> float:
-        """
-        Read a single parameter from the motor.
-        
-        Args:
-            param_index: Parameter index (e.g., protocol.PARAM_LOC_KP)
-            timeout: Response timeout in seconds
-        
         Returns:
             Parameter value
         """
-        can_id, data = protocol.pack_read_param_command(self.motor_id, param_index, self.host_id)
-        self._send_command(can_id, data)
-        index, value = self._wait_for_response(0x11, timeout)
+        if self.protocol != ProtocolType.PRIVATE:
+            raise RuntimeError("Parameter getting only supported in private protocol mode")
         
-        if index != param_index:
-            raise ProtocolError(f"Received parameter 0x{index:04X}, expected 0x{param_index:04X}")
+        can_id = (CommunicationType.GET_SINGLE_PARAMETER << 24) | (self.master_id << 8) | self.can_id
+        data = [
+            address & 0xFF, (address >> 8) & 0xFF,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        ]
         
-        return value
+        response = self._send_and_wait_response(can_id, data, True, timeout)
+        if response:
+            return self._parse_parameter_response(response, address)
+        else:
+            raise TimeoutError(f"No response for parameter 0x{address:04X}")
     
-    def save_configuration(self) -> None:
+    def get_device_id(self, timeout: Optional[float] = None) -> Optional[bytes]:
         """
-        Save current motor configuration to flash memory (Communication Type 22).
-        
-        This saves parameters that were written with Communication Type 18.
-        """
-        can_id, data = protocol.pack_save_data_command(self.motor_id, self.host_id)
-        self._send_command(can_id, data)
-    
-    def set_active_reporting(self, enable: bool) -> None:
-        """
-        Enable or disable active status reporting (Communication Type 24).
+        Get device unique ID.
         
         Args:
-            enable: True to enable 10ms status reports, False to disable
+            timeout: Response timeout (uses default if None)
+            
+        Returns:
+            Device unique ID (8 bytes) or None if no response
         """
-        can_id, data = protocol.pack_set_active_report_command(self.motor_id, enable, self.host_id)
-        self._send_command(can_id, data)
-    
-    def set_motor_id(self, new_id: int) -> None:
-        """
-        Change the motor's CAN ID (Communication Type 7).
+        if self.protocol != ProtocolType.PRIVATE:
+            raise RuntimeError("Device ID only supported in private protocol mode")
         
-        Args:
-            new_id: New CAN ID for the motor (1-255)
+        can_id = (CommunicationType.GET_ID << 24) | (self.master_id << 8) | self.can_id
+        data = [0x00] * 8
         
-        Note: This takes effect immediately. Update your Motor instance accordingly.
-        """
-        can_id, data = protocol.pack_set_motor_id_command(self.motor_id, new_id, self.host_id)
-        self._send_command(can_id, data)
-        # Update our own motor_id
-        self.motor_id = new_id
+        response = self._send_and_wait_response(can_id, data, True, timeout)
+        if response:
+            return bytes(response['data'])
+        return None
     
-    # ========================== Cleanup ==========================
-    
-    def close(self) -> None:
-        """
-        Clean up resources and stop background threads.
+    def _mit_motion_control(self, position: float, velocity: float, kp: float, kd: float, torque: float):
+        """MIT protocol motion control - matches C++ implementation exactly"""
+        can_id = self.can_id
         
-        Call this when you're done with the motor to ensure proper cleanup.
-        """
-        self._stop_event.set()
-        if hasattr(self, 'notifier'):
-            self.notifier.stop()
+        # Encode parameters - exactly matching C++ float_to_uint calls
+        pos_encoded = float_to_uint(position, P_MIN, P_MAX, 16)
+        vel_encoded = float_to_uint(velocity, V_MIN, V_MAX, 12)
+        kp_encoded = float_to_uint(kp, KP_MIN, KP_MAX, 12)
+        kd_encoded = float_to_uint(kd, KD_MIN, KD_MAX, 12)
+        torque_encoded = float_to_uint(torque, T_MIN, T_MAX, 12)
+        
+        # Data packing exactly matching C++ implementation
+        data = [
+            (pos_encoded >> 8) & 0xFF,  # txdata[0]
+            pos_encoded & 0xFF,         # txdata[1]
+            (vel_encoded >> 4) & 0xFF,  # txdata[2] = vel>>4
+            ((vel_encoded & 0x0F) << 4) | ((kp_encoded >> 8) & 0x0F),  # txdata[3] = vel<<4 | kp>>8
+            kp_encoded & 0xFF,          # txdata[4] = kp&0xFF
+            (kd_encoded >> 4) & 0xFF,   # txdata[5] = kd>>4
+            ((kd_encoded & 0x0F) << 4) | ((torque_encoded >> 8) & 0x0F),  # txdata[6] = kd<<4 | torque>>8
+            torque_encoded & 0xFF       # txdata[7] = torque&0xFF
+        ]
+        
+        self._send_can_message(can_id, data, False)
+    
+    def _private_motion_control(self, position: float, velocity: float, kp: float, kd: float, torque: float):
+        """Private protocol motion control"""
+        # Encode torque in CAN ID
+        torque_encoded = float_to_uint(torque, T_MIN, T_MAX, 16)
+        can_id = (CommunicationType.MOTION_CONTROL << 24) | (torque_encoded << 8) | self.can_id
+        
+        # Encode other parameters in data
+        pos_encoded = float_to_uint(position, P_MIN, P_MAX, 16)
+        vel_encoded = float_to_uint(velocity, V_MIN, V_MAX, 16)
+        kp_encoded = float_to_uint(kp, KP_MIN, KP_MAX, 16)
+        kd_encoded = float_to_uint(kd, KD_MIN, KD_MAX, 16)
+        
+        data = [
+            (pos_encoded >> 8) & 0xFF, pos_encoded & 0xFF,
+            (vel_encoded >> 8) & 0xFF, vel_encoded & 0xFF,
+            (kp_encoded >> 8) & 0xFF, kp_encoded & 0xFF,
+            (kd_encoded >> 8) & 0xFF, kd_encoded & 0xFF
+        ]
+        
+        self._send_can_message(can_id, data, True)
+    
+    def _send_can_message(self, can_id: int, data: list, is_extended: bool):
+        """Send CAN message"""
+        try:
+            self.can_interface.send_message(can_id, data, is_extended)
+        except Exception as e:
+            logger.error(f"Failed to send CAN message to motor {self.can_id}: {e}")
+            raise
+    
+    def _send_and_wait_response(self, can_id: int, data: list, is_extended: bool, timeout: Optional[float] = None) -> Optional[dict]:
+        """Send message and wait for response"""
+        if timeout is None:
+            timeout = self.timeout
+        
+        with self._response_lock:
+            self._last_response = None
+            self._waiting_for_response = True
+            
+            self._send_can_message(can_id, data, is_extended)
+            
+            # Wait for response
+            start_time = time.time()
+            while self._waiting_for_response and (time.time() - start_time) < timeout:
+                time.sleep(0.001)  # 1ms polling
+            
+            self._waiting_for_response = False
+            return self._last_response
+    
+    def _on_can_message(self, can_id: int, data: list, is_extended: bool):
+        """Handle received CAN message"""
+        try:
+            if self.protocol == ProtocolType.MIT:
+                self._parse_mit_feedback(can_id, data, is_extended)
+            else:
+                self._parse_private_feedback(can_id, data, is_extended)
+        except Exception as e:
+            logger.error(f"Error parsing CAN message: {e}")
+    
+    def _parse_private_feedback(self, can_id: int, data: list, is_extended: bool):
+        """Parse private protocol feedback"""
+        if not is_extended:
+            return
+        
+        comm_type = (can_id & 0x3F000000) >> 24
+        error_code = (can_id & 0x3F0000) >> 16
+        mode = (can_id & 0xC00000) >> 22
+        motor_id = (can_id & 0xFF00) >> 8
+        
+        # Check if message is for this motor
+        if motor_id != self.can_id and (can_id & 0xFF) != 0xFE:
+            return
+        
+        if comm_type == 2:  # Status feedback
+            self.position = uint16_to_float((data[0] << 8) | data[1], P_MIN, P_MAX, 16)
+            self.velocity = uint16_to_float((data[2] << 8) | data[3], V_MIN, V_MAX, 16)
+            self.torque = uint16_to_float((data[4] << 8) | data[5], T_MIN, T_MAX, 16)
+            self.temperature = ((data[6] << 8) | data[7]) * 0.1
+            self.error_code = error_code
+            
+        elif comm_type == 17:  # Parameter response
+            if self._waiting_for_response:
+                self._last_response = {'can_id': can_id, 'data': data}
+                self._waiting_for_response = False
+                
+        elif (can_id & 0xFF) == 0xFE:  # Device ID response
+            self.unique_id = bytes(data)
+            if self._waiting_for_response:
+                self._last_response = {'can_id': can_id, 'data': data}
+                self._waiting_for_response = False
+    
+    def _parse_mit_feedback(self, can_id: int, data: list, is_extended: bool):
+        """Parse MIT protocol feedback"""
+        if is_extended:
+            return
+        
+        if (can_id & 0xFF) == 0xFD:  # MIT status feedback
+            if all(d == 0x00 for d in data[3:8]):  # Error feedback
+                fault16 = (data[2] << 8) | data[1]
+                self.error_code = map_faults(fault16)
+            else:  # Normal status feedback
+                self.position = uint16_to_float((data[1] << 8) | data[2], P_MIN, P_MAX, 16)
+                self.velocity = uint16_to_float((data[3] << 4) | (data[4] >> 4), V_MIN, V_MAX, 12)
+                self.torque = uint16_to_float((data[4] << 8) | data[5], T_MIN, T_MAX, 12)
+                self.temperature = ((data[6] << 8) | data[7]) * 0.1
+    
+    def _parse_parameter_response(self, response: dict, address: int) -> Union[int, float]:
+        """Parse parameter response"""
+        data = response['data']
+        param_address = (data[1] << 8) | data[0]
+        
+        if param_address != address:
+            raise ValueError(f"Response address mismatch: expected 0x{address:04X}, got 0x{param_address:04X}")
+        
+        if address == ParameterAddress.RUN_MODE:
+            return data[4]
+        else:
+            return bytes_to_float(data[4:8])
+    
+    @property
+    def is_connected(self) -> bool:
+        """Check if motor is connected"""
+        return self._connected
+    
+    @property
+    def is_enabled(self) -> bool:
+        """Check if motor is enabled"""
+        return self._enabled
     
     def __enter__(self):
-        """Context manager entry."""
+        """Context manager entry"""
+        self.connect()
         return self
     
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit."""
-        self.close()
-
-
-# ========================== Convenience Functions ==========================
-
-def create_motor_from_can_interface(motor_id: int, interface: str = 'socketcan', 
-                                   channel: str = 'can0', bitrate: int = 1000000, 
-                                   **kwargs) -> Motor:
-    """
-    Create a Motor instance with a new CAN bus.
-    
-    Args:
-        motor_id: Motor CAN ID
-        interface: CAN interface type ('socketcan', 'pcan', 'kvaser', etc.)
-        channel: CAN channel name
-        bitrate: CAN bitrate (default: 1000000 for 1Mbps)
-        **kwargs: Additional arguments passed to Motor constructor
-    
-    Returns:
-        Motor instance
-    
-    Example:
-        >>> motor = create_motor_from_can_interface(1, 'pcan', 'PCAN_USBBUS1')
-        >>> motor.enable()
-        >>> # ... use motor ...
-        >>> motor.close()
-    """
-    bus = can.interface.Bus(channel=channel, bustype=interface, bitrate=bitrate)
-    return Motor(motor_id, bus, **kwargs)
+        """Context manager exit"""
+        self.disconnect()
