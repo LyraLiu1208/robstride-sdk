@@ -19,7 +19,7 @@ import sys
 sys.path.append(str(Path(__file__).parent.parent))
 
 
-from robstride import RobStrideMotor
+from robstride import RobStrideMotor, MotorType
 
 
 # Setup basic logging
@@ -35,15 +35,17 @@ logger = logging.getLogger(__name__)
 class TrajectoryTracker:
     """Trajectory tracking controller for RobStride motors using Private protocol."""
     
-    def __init__(self, motor_id: int = 0x7F, can_interface: str = "can1"):
+    def __init__(self, motor_id: int = 0x7F, can_interface: str = "can1", motor_type: MotorType = MotorType.RS05):
        """Initialize trajectory tracker.
       
        Args:
            motor_id: Motor CAN ID
            can_interface: CAN interface name
+           motor_type: Motor type (RS05, RS00, RS03, RS06)
        """
        self.motor_id = motor_id
        self.can_interface = can_interface
+       self.motor_type = motor_type
        self.motor = None
       
     def connect(self) -> bool:
@@ -53,11 +55,12 @@ class TrajectoryTracker:
            True if connection successful, False otherwise
        """
        try:
-           # Initialize motor with Private protocol
+           # Initialize motor with specified type
            self.motor = RobStrideMotor(
                can_id=self.motor_id,
                interface=self.can_interface,
-               timeout=2.0
+               timeout=2.0,
+               motor_type=self.motor_type
            )
           
            # Connect to motor
@@ -67,7 +70,9 @@ class TrajectoryTracker:
            self.motor.enable()
            time.sleep(0.1)
               
-           logger.info(f"Successfully connected to motor {self.motor_id:#04x}")
+           logger.info(f"Successfully connected to motor {self.motor_id:#04x} ({self.motor_type.name})")
+           logger.info(f"Motor limits - Velocity: {self.motor.limits['v_min']:.1f} to {self.motor.limits['v_max']:.1f} rad/s")
+           logger.info(f"Motor limits - Torque: {self.motor.limits['t_min']:.1f} to {self.motor.limits['t_max']:.1f} Nm")
            return True
           
        except Exception as e:
@@ -99,12 +104,27 @@ class TrajectoryTracker:
        Returns:
            Tuple of (time_array, position_array, velocity_array)
        """
+       # Validate amplitude against motor position limits
+       if amplitude > (self.motor.limits['p_max'] - abs(start_pos)):
+           max_amplitude = self.motor.limits['p_max'] - abs(start_pos)
+           logger.warning(f"Amplitude {amplitude:.2f} too large, limiting to {max_amplitude:.2f}")
+           amplitude = max_amplitude
+       
+       # Check if trajectory will exceed velocity limits
+       max_vel = 2 * np.pi * frequency * amplitude
+       if max_vel > abs(self.motor.limits['v_max']):
+           max_freq = abs(self.motor.limits['v_max']) / (2 * np.pi * amplitude)
+           logger.warning(f"Trajectory velocity {max_vel:.1f} exceeds limit {abs(self.motor.limits['v_max']):.1f}")
+           logger.warning(f"Consider reducing frequency to {max_freq:.2f} Hz or amplitude")
+       
        duration = num_periods / frequency
        t = np.linspace(0, duration, int(duration * control_freq))
        pos = start_pos + amplitude * np.sin(2 * np.pi * frequency * t)
        vel = 2 * np.pi * frequency * amplitude * np.cos(2 * np.pi * frequency * t)
       
        logger.info(f"Generated trajectory: {len(t)} points, {duration:.2f}s duration")
+       logger.info(f"Position range: {np.min(pos):.2f} to {np.max(pos):.2f} rad")
+       logger.info(f"Velocity range: {np.min(vel):.2f} to {np.max(vel):.2f} rad/s")
        return t, pos, vel
   
     def execute_trajectory(self, t: np.ndarray, pos: np.ndarray, vel: np.ndarray,
@@ -122,12 +142,21 @@ class TrajectoryTracker:
        Returns:
            List of recorded data points
        """
+       # Validate gains against motor limits
+       if kp > self.motor.limits['kp_max']:
+           logger.warning(f"Kp {kp} exceeds limit {self.motor.limits['kp_max']}, clamping")
+           kp = self.motor.limits['kp_max']
+       if kd > self.motor.limits['kd_max']:
+           logger.warning(f"Kd {kd} exceeds limit {self.motor.limits['kd_max']}, clamping")
+           kd = self.motor.limits['kd_max']
+       
        data = []
        dt = 1.0 / control_freq
        error_count = 0
        max_errors = 5
       
        logger.info(f"Executing trajectory: {len(t)} steps at {control_freq}Hz")
+       logger.info(f"Using gains: Kp={kp:.1f}, Kd={kd:.3f}")
       
        for i in range(len(t)):
            target_pos = pos[i]
@@ -309,8 +338,10 @@ def parse_arguments():
   
    parser.add_argument('--motor-id', type=lambda x: int(x, 0), default=0x7F,
                       help='Motor CAN ID (hex or decimal)')
-   parser.add_argument('--can-interface', type=str, default='can1',
+   parser.add_argument('--can-interface', type=str, default='can0',
                       help='CAN interface name')
+   parser.add_argument('--motor-type', type=str, choices=['RS05', 'RS00', 'RS03', 'RS06'], 
+                      default='RS05', help='Motor type (default: RS05)')
    parser.add_argument('--amplitude', type=float, default=3.14,
                       help='Sine wave amplitude (rad)')
    parser.add_argument('--frequency', type=float, default=0.5,
@@ -334,10 +365,14 @@ def parse_arguments():
 def main():
    """Main function."""
    args = parse_arguments()
+   
+   # Convert motor type string to enum
+   motor_type = MotorType[args.motor_type]
   
    logger.info("Starting RobStride trajectory tracking test (Private Protocol)")
    logger.info("Parameters:")
    logger.info(f"  - Motor ID: {args.motor_id:#04x}")
+   logger.info(f"  - Motor Type: {args.motor_type}")
    logger.info(f"  - CAN Interface: {args.can_interface}")
    logger.info(f"  - Amplitude: {args.amplitude} rad")
    logger.info(f"  - Frequency: {args.frequency} Hz")
@@ -348,7 +383,8 @@ def main():
    # Initialize tracker
    tracker = TrajectoryTracker(
        motor_id=args.motor_id,
-       can_interface=args.can_interface
+       can_interface=args.can_interface,
+       motor_type=motor_type
    )
   
    try:
@@ -387,8 +423,8 @@ def main():
            return False
       
        # Save results
-       csv_filename = f"{args.output_prefix}_data.csv"
-       plot_filename = f"{args.output_prefix}_plot.png"
+       csv_filename = f"{args.output_prefix}_{args.motor_type}_data.csv"
+       plot_filename = f"{args.output_prefix}_{args.motor_type}_plot.png"
       
        csv_success = tracker.save_data_to_csv(data, csv_filename)
        plot_success = tracker.plot_trajectory(data, plot_filename)

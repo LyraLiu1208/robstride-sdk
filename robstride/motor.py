@@ -8,8 +8,9 @@ from typing import Optional, Union
 from threading import Lock
 
 from .protocol import (
-    ControlMode, CommunicationType, ParameterAddress,
-    P_MIN, P_MAX, V_MIN, V_MAX, KP_MIN, KP_MAX, KD_MIN, KD_MAX, T_MIN, T_MAX
+    ControlMode, CommunicationType, ParameterAddress, MotorType,
+    P_MIN, P_MAX, V_MIN, V_MAX, KP_MIN, KP_MAX, KD_MIN, KD_MAX, T_MIN, T_MAX,
+    get_motor_limits
 )
 from .utils import (
     float_to_uint, uint16_to_float, bytes_to_float, float_to_bytes, 
@@ -26,7 +27,8 @@ class RobStrideMotor:
                  can_id: int, 
                  interface: str = 'can0',
                  master_id: int = 0xFD,
-                 timeout: float = 1.0):
+                 timeout: float = 1.0,
+                 motor_type: MotorType = MotorType.RS05):
         """
         Initialize RobStride motor.
         
@@ -35,10 +37,15 @@ class RobStrideMotor:
             interface: CAN interface name (e.g., 'can0', 'can1')
             master_id: Master controller ID (default: 0xFD)
             timeout: Response timeout in seconds
+            motor_type: Motor type (RS05, RS09, RS03, RS06)
         """
         self.can_id = can_id
         self.master_id = master_id
         self.timeout = timeout
+        self.motor_type = motor_type
+        
+        # Get motor-specific limits
+        self.limits = get_motor_limits(motor_type)
         
         # CAN interface
         self.can_interface = CANInterface(interface)
@@ -67,7 +74,7 @@ class RobStrideMotor:
             self.can_interface.connect()
             self.can_interface.add_message_callback(self._on_can_message)
             self._connected = True
-            logger.info(f"Connected to motor {self.can_id} on {self.can_interface.interface_name}")
+            logger.info(f"Connected to motor {self.can_id} ({self.motor_type.name}) on {self.can_interface.interface_name}")
             
             # Get device ID to verify connection
             self.get_device_id()
@@ -150,12 +157,12 @@ class RobStrideMotor:
         if not self._enabled:
             raise RuntimeError("Motor not enabled")
         
-        # Validate parameters
-        validate_parameter_range("position", position, P_MIN, P_MAX)
-        validate_parameter_range("velocity", velocity, V_MIN, V_MAX)
-        validate_parameter_range("kp", kp, KP_MIN, KP_MAX)
-        validate_parameter_range("kd", kd, KD_MIN, KD_MAX)
-        validate_parameter_range("torque", torque, T_MIN, T_MAX)
+        # Validate parameters using motor-specific limits
+        validate_parameter_range("position", position, self.limits['p_min'], self.limits['p_max'])
+        validate_parameter_range("velocity", velocity, self.limits['v_min'], self.limits['v_max'])
+        validate_parameter_range("kp", kp, self.limits['kp_min'], self.limits['kp_max'])
+        validate_parameter_range("kd", kd, self.limits['kd_min'], self.limits['kd_max'])
+        validate_parameter_range("torque", torque, self.limits['t_min'], self.limits['t_max'])
         
         self._private_motion_control(position, velocity, kp, kd, torque)
     
@@ -171,7 +178,7 @@ class RobStrideMotor:
             raise RuntimeError("Motor not enabled")
         
         validate_parameter_range("position", position, -4*3.14159, 4*3.14159)
-        validate_parameter_range("speed_limit", speed_limit, 0, 44.0)
+        validate_parameter_range("speed_limit", speed_limit, 0, abs(self.limits['v_max']))
         
         # Set to position control mode
         self.set_parameter(ParameterAddress.RUN_MODE, ControlMode.POSITION)
@@ -193,7 +200,7 @@ class RobStrideMotor:
         if not self._enabled:
             raise RuntimeError("Motor not enabled")
         
-        validate_parameter_range("velocity", velocity, -30.0, 30.0)
+        validate_parameter_range("velocity", velocity, self.limits['v_min'], self.limits['v_max'])
         validate_parameter_range("current_limit", current_limit, 0, 23.0)
         
         # Set to velocity control mode
@@ -294,15 +301,15 @@ class RobStrideMotor:
     
     def _private_motion_control(self, position: float, velocity: float, kp: float, kd: float, torque: float):
         """Private protocol motion control"""
-        # Encode torque in CAN ID
-        torque_encoded = float_to_uint(torque, T_MIN, T_MAX, 16)
+        # Encode torque in CAN ID using motor-specific limits
+        torque_encoded = float_to_uint(torque, self.limits['t_min'], self.limits['t_max'], 16)
         can_id = (CommunicationType.MOTION_CONTROL << 24) | (torque_encoded << 8) | self.can_id
         
-        # Encode other parameters in data
-        pos_encoded = float_to_uint(position, P_MIN, P_MAX, 16)
-        vel_encoded = float_to_uint(velocity, V_MIN, V_MAX, 16)
-        kp_encoded = float_to_uint(kp, KP_MIN, KP_MAX, 16)
-        kd_encoded = float_to_uint(kd, KD_MIN, KD_MAX, 16)
+        # Encode other parameters in data using motor-specific limits
+        pos_encoded = float_to_uint(position, self.limits['p_min'], self.limits['p_max'], 16)
+        vel_encoded = float_to_uint(velocity, self.limits['v_min'], self.limits['v_max'], 16)
+        kp_encoded = float_to_uint(kp, self.limits['kp_min'], self.limits['kp_max'], 16)
+        kd_encoded = float_to_uint(kd, self.limits['kd_min'], self.limits['kd_max'], 16)
         
         data = [
             (pos_encoded >> 8) & 0xFF, pos_encoded & 0xFF,
@@ -361,9 +368,9 @@ class RobStrideMotor:
             return
         
         if comm_type == 2:  # Status feedback
-            self.position = uint16_to_float((data[0] << 8) | data[1], P_MIN, P_MAX, 16)
-            self.velocity = uint16_to_float((data[2] << 8) | data[3], V_MIN, V_MAX, 16)
-            self.torque = uint16_to_float((data[4] << 8) | data[5], T_MIN, T_MAX, 16)
+            self.position = uint16_to_float((data[0] << 8) | data[1], self.limits['p_min'], self.limits['p_max'], 16)
+            self.velocity = uint16_to_float((data[2] << 8) | data[3], self.limits['v_min'], self.limits['v_max'], 16)
+            self.torque = uint16_to_float((data[4] << 8) | data[5], self.limits['t_min'], self.limits['t_max'], 16)
             self.temperature = ((data[6] << 8) | data[7]) * 0.1
             self.error_code = error_code
             
