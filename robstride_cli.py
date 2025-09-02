@@ -9,7 +9,7 @@ import argparse
 import logging
 import time
 import sys
-from robstride import RobStrideMotor, ProtocolType
+from robstride import RobStrideMotor
 
 def setup_logging(verbose: bool):
     """Setup logging configuration"""
@@ -20,14 +20,11 @@ def setup_logging(verbose: bool):
     )
 
 def create_motor(args) -> RobStrideMotor:
-    """Create motor instance from command line arguments"""
-    protocol = ProtocolType.MIT if args.mit else ProtocolType.PRIVATE
-    
+    """Create motor instance from command line arguments"""    
     return RobStrideMotor(
         can_id=args.motor_id,
         interface=args.interface,
         master_id=args.master_id,
-        protocol=protocol,
         timeout=args.timeout
     )
 
@@ -36,15 +33,14 @@ def cmd_info(args):
     with create_motor(args) as motor:
         print(f"Motor ID: {motor.can_id}")
         print(f"Interface: {motor.can_interface.interface_name}")
-        print(f"Protocol: {motor.protocol.value}")
+        print(f"Protocol: Private")
         print(f"Master ID: 0x{motor.master_id:02X}")
         
-        if motor.protocol == ProtocolType.PRIVATE:
-            unique_id = motor.get_device_id()
-            if unique_id:
-                print(f"Unique ID: {unique_id.hex().upper()}")
-            else:
-                print("Unique ID: Not available")
+        unique_id = motor.get_device_id()
+        if unique_id:
+            print(f"Unique ID: {unique_id.hex().upper()}")
+        else:
+            print("Unique ID: Not available")
 
 def cmd_enable(args):
     """Enable motor"""
@@ -132,10 +128,6 @@ def cmd_velocity(args):
 def cmd_current(args):
     """Current control command"""
     with create_motor(args) as motor:
-        if motor.protocol == ProtocolType.MIT:
-            print("Error: Current control not supported in MIT mode")
-            return
-        
         motor.enable()
         
         motor.set_current_control(current=args.current)
@@ -169,8 +161,6 @@ def main():
                        help='Motor CAN ID (1-255)')
     parser.add_argument('--master_id', type=lambda x: int(x, 0), default=0xFD,
                        help='Master CAN ID (default: 0xFD)')
-    parser.add_argument('--mit', action='store_true',
-                       help='Use MIT protocol (default: Private protocol)')
     parser.add_argument('--timeout', type=float, default=1.0,
                        help='Response timeout in seconds (default: 1.0)')
     parser.add_argument('--verbose', '-v', action='store_true',

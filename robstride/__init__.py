@@ -15,16 +15,14 @@ Basic Usage:
 """
 
 from .motor import RobStrideMotor
-from .protocol import ProtocolType, ControlMode
-from .utils import float_to_uint, uint16_to_float, map_faults
+from .protocol import ControlMode
+from .utils import float_to_uint, uint16_to_float
 
 __version__ = "1.0.0"
 __author__ = "RobStride Team"
 __all__ = [
     "RobStrideMotor", 
-    "ProtocolType", 
     "ControlMode",
     "float_to_uint",
-    "uint16_to_float", 
-    "map_faults"
+    "uint16_to_float"
 ]

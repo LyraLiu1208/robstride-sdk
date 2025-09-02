@@ -8,12 +8,12 @@ from typing import Optional, Union
 from threading import Lock
 
 from .protocol import (
-    ProtocolType, ControlMode, CommunicationType, ParameterAddress,
+    ControlMode, CommunicationType, ParameterAddress,
     P_MIN, P_MAX, V_MIN, V_MAX, KP_MIN, KP_MAX, KD_MIN, KD_MAX, T_MIN, T_MAX
 )
 from .utils import (
     float_to_uint, uint16_to_float, bytes_to_float, float_to_bytes, 
-    map_faults, validate_parameter_range
+    validate_parameter_range
 )
 from .can_interface import CANInterface
 
@@ -26,7 +26,6 @@ class RobStrideMotor:
                  can_id: int, 
                  interface: str = 'can0',
                  master_id: int = 0xFD,
-                 protocol: ProtocolType = ProtocolType.MIT,
                  timeout: float = 1.0):
         """
         Initialize RobStride motor.
@@ -35,12 +34,10 @@ class RobStrideMotor:
             can_id: Motor CAN ID (1-255)
             interface: CAN interface name (e.g., 'can0', 'can1')
             master_id: Master controller ID (default: 0xFD)
-            protocol: Communication protocol (PRIVATE or MIT)
             timeout: Response timeout in seconds
         """
         self.can_id = can_id
         self.master_id = master_id
-        self.protocol = protocol
         self.timeout = timeout
         
         # CAN interface
@@ -72,15 +69,8 @@ class RobStrideMotor:
             self._connected = True
             logger.info(f"Connected to motor {self.can_id} on {self.can_interface.interface_name}")
             
-            # Set protocol if MIT mode is requested
-            if self.protocol == ProtocolType.MIT:
-                logger.info(f"Setting motor {self.can_id} to MIT protocol mode")
-                self.set_protocol(2)  # 2 = MIT protocol
-                time.sleep(0.1)  # Give time for protocol change
-            
-            # Get device ID to verify connection (only for private protocol)
-            if self.protocol == ProtocolType.PRIVATE:
-                self.get_device_id()
+            # Get device ID to verify connection
+            self.get_device_id()
             
         except Exception as e:
             logger.error(f"Failed to connect to motor {self.can_id}: {e}")
@@ -103,14 +93,9 @@ class RobStrideMotor:
         if not self._connected:
             raise RuntimeError("Motor not connected")
         
-        if self.protocol == ProtocolType.MIT:
-            can_id = self.can_id
-            data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFC]
-            is_extended = False
-        else:
-            can_id = (CommunicationType.MOTOR_ENABLE << 24) | (self.master_id << 8) | self.can_id
-            data = [0x00] * 8
-            is_extended = True
+        can_id = (CommunicationType.MOTOR_ENABLE << 24) | (self.master_id << 8) | self.can_id
+        data = [0x00] * 8
+        is_extended = True
         
         self._send_can_message(can_id, data, is_extended)
         self._enabled = True
@@ -126,14 +111,9 @@ class RobStrideMotor:
         if not self._connected:
             return
         
-        if self.protocol == ProtocolType.MIT:
-            can_id = self.can_id
-            data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFD]
-            is_extended = False
-        else:
-            can_id = (CommunicationType.MOTOR_STOP << 24) | (self.master_id << 8) | self.can_id
-            data = [int(clear_error)] + [0x00] * 7
-            is_extended = True
+        can_id = (CommunicationType.MOTOR_STOP << 24) | (self.master_id << 8) | self.can_id
+        data = [int(clear_error)] + [0x00] * 7
+        is_extended = True
         
         self._send_can_message(can_id, data, is_extended)
         self._enabled = False
@@ -144,50 +124,12 @@ class RobStrideMotor:
         if not self._enabled:
             raise RuntimeError("Motor not enabled")
         
-        if self.protocol == ProtocolType.MIT:
-            can_id = self.can_id
-            data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE]
-            is_extended = False
-        else:
-            can_id = (CommunicationType.SET_POS_ZERO << 24) | (self.master_id << 8) | self.can_id
-            data = [0x01] + [0x00] * 7
-            is_extended = True
+        can_id = (CommunicationType.SET_POS_ZERO << 24) | (self.master_id << 8) | self.can_id
+        data = [0x01] + [0x00] * 7
+        is_extended = True
         
         self._send_can_message(can_id, data, is_extended)
         logger.info(f"Set zero position for motor {self.can_id}")
-    
-    def set_protocol(self, protocol_type: int):
-        """
-        Set motor communication protocol (requires power cycle to take effect).
-        
-        Args:
-            protocol_type: Protocol type (0=Private, 1=CANopen, 2=MIT)
-        """
-        if not self._connected:
-            raise RuntimeError("Motor not connected")
-        
-        if protocol_type not in [0, 1, 2]:
-            raise ValueError("Protocol type must be 0 (Private), 1 (CANopen), or 2 (MIT)")
-        
-        if self.protocol == ProtocolType.MIT:
-            # MIT protocol: FF FF FF FF FF FF F_CMD FC
-            can_id = self.can_id
-            data = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, protocol_type, 0xFC]
-            is_extended = False
-        else:
-            # Private protocol: Communication_Type_MotorModeSet (0x19)
-            can_id = (CommunicationType.MOTOR_MODE_SET << 24) | (self.master_id << 8) | self.can_id
-            data = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, protocol_type, 0x08]
-            is_extended = True
-        
-        self._send_can_message(can_id, data, is_extended)
-        logger.info(f"Set protocol type {protocol_type} for motor {self.can_id} (requires power cycle)")
-        
-        # Update internal protocol setting
-        if protocol_type == 0:
-            self.protocol = ProtocolType.PRIVATE
-        elif protocol_type == 2:
-            self.protocol = ProtocolType.MIT
     
     def set_motion_control(self, 
                           position: float = 0.0,
@@ -196,7 +138,7 @@ class RobStrideMotor:
                           kd: float = 0.0,
                           torque: float = 0.0):
         """
-        Send motion control command.
+        Send motion control command using private protocol.
         
         Args:
             position: Target position (radians)
@@ -204,10 +146,6 @@ class RobStrideMotor:
             kp: Position gain
             kd: Velocity gain  
             torque: Feed-forward torque (Nm)
-            
-        Note:
-            For MIT protocol, motor must be enabled first.
-            Optionally call set_zero_position() before motion control.
         """
         if not self._enabled:
             raise RuntimeError("Motor not enabled")
@@ -219,10 +157,7 @@ class RobStrideMotor:
         validate_parameter_range("kd", kd, KD_MIN, KD_MAX)
         validate_parameter_range("torque", torque, T_MIN, T_MAX)
         
-        if self.protocol == ProtocolType.MIT:
-            self._mit_motion_control(position, velocity, kp, kd, torque)
-        else:
-            self._private_motion_control(position, velocity, kp, kd, torque)
+        self._private_motion_control(position, velocity, kp, kd, torque)
     
     def set_position_control(self, position: float, speed_limit: float = 5.0):
         """
@@ -238,19 +173,14 @@ class RobStrideMotor:
         validate_parameter_range("position", position, -4*3.14159, 4*3.14159)
         validate_parameter_range("speed_limit", speed_limit, 0, 44.0)
         
-        if self.protocol == ProtocolType.MIT:
-            # MIT protocol doesn't have separate position control mode
-            # Use motion control with only position parameter
-            self.set_motion_control(position=position, velocity=0.0, kp=50.0, kd=1.0, torque=0.0)
-        else:
-            # Set to position control mode
-            self.set_parameter(ParameterAddress.RUN_MODE, ControlMode.POSITION)
-            time.sleep(0.01)
-            # Set target position
-            self.set_parameter(ParameterAddress.TARGET_POSITION, position)
-            time.sleep(0.01)
-            # Set speed limit
-            self.set_parameter(ParameterAddress.LIMIT_VELOCITY, speed_limit)
+        # Set to position control mode
+        self.set_parameter(ParameterAddress.RUN_MODE, ControlMode.POSITION)
+        time.sleep(0.01)
+        # Set target position
+        self.set_parameter(ParameterAddress.TARGET_POSITION, position)
+        time.sleep(0.01)
+        # Set speed limit
+        self.set_parameter(ParameterAddress.LIMIT_VELOCITY, speed_limit)
     
     def set_velocity_control(self, velocity: float, current_limit: float = 10.0):
         """
@@ -266,19 +196,14 @@ class RobStrideMotor:
         validate_parameter_range("velocity", velocity, -30.0, 30.0)
         validate_parameter_range("current_limit", current_limit, 0, 23.0)
         
-        if self.protocol == ProtocolType.MIT:
-            # MIT protocol doesn't have separate velocity control mode
-            # Use motion control with only velocity parameter
-            self.set_motion_control(position=0.0, velocity=velocity, kp=0.0, kd=0.1, torque=0.0)
-        else:
-            # Set to velocity control mode
-            self.set_parameter(ParameterAddress.RUN_MODE, ControlMode.VELOCITY)
-            time.sleep(0.01)
-            # Set target velocity
-            self.set_parameter(ParameterAddress.TARGET_VELOCITY, velocity)
-            time.sleep(0.01)
-            # Set current limit
-            self.set_parameter(ParameterAddress.LIMIT_CURRENT, current_limit)
+        # Set to velocity control mode
+        self.set_parameter(ParameterAddress.RUN_MODE, ControlMode.VELOCITY)
+        time.sleep(0.01)
+        # Set target velocity
+        self.set_parameter(ParameterAddress.TARGET_VELOCITY, velocity)
+        time.sleep(0.01)
+        # Set current limit
+        self.set_parameter(ParameterAddress.LIMIT_CURRENT, current_limit)
     
     def set_current_control(self, current: float):
         """
@@ -292,14 +217,11 @@ class RobStrideMotor:
         
         validate_parameter_range("current", current, -23.0, 23.0)
         
-        if self.protocol == ProtocolType.PRIVATE:
-            # Set to current control mode
-            self.set_parameter(ParameterAddress.RUN_MODE, ControlMode.CURRENT)
-            time.sleep(0.01)
-            # Set target current
-            self.set_parameter(ParameterAddress.TARGET_CURRENT, current)
-        else:
-            raise NotImplementedError("Current control not supported in MIT mode")
+        # Set to current control mode
+        self.set_parameter(ParameterAddress.RUN_MODE, ControlMode.CURRENT)
+        time.sleep(0.01)
+        # Set target current
+        self.set_parameter(ParameterAddress.TARGET_CURRENT, current)
     
     def set_parameter(self, address: int, value: Union[int, float]):
         """
@@ -309,9 +231,6 @@ class RobStrideMotor:
             address: Parameter address
             value: Parameter value
         """
-        if self.protocol != ProtocolType.PRIVATE:
-            raise RuntimeError("Parameter setting only supported in private protocol mode")
-        
         can_id = (CommunicationType.SET_SINGLE_PARAMETER << 24) | (self.master_id << 8) | self.can_id
         
         if isinstance(value, int) and 0 <= value < 256:
@@ -343,9 +262,6 @@ class RobStrideMotor:
         Returns:
             Parameter value
         """
-        if self.protocol != ProtocolType.PRIVATE:
-            raise RuntimeError("Parameter getting only supported in private protocol mode")
-        
         can_id = (CommunicationType.GET_SINGLE_PARAMETER << 24) | (self.master_id << 8) | self.can_id
         data = [
             address & 0xFF, (address >> 8) & 0xFF,
@@ -368,9 +284,6 @@ class RobStrideMotor:
         Returns:
             Device unique ID (8 bytes) or None if no response
         """
-        if self.protocol != ProtocolType.PRIVATE:
-            raise RuntimeError("Device ID only supported in private protocol mode")
-        
         can_id = (CommunicationType.GET_ID << 24) | (self.master_id << 8) | self.can_id
         data = [0x00] * 8
         
@@ -378,31 +291,6 @@ class RobStrideMotor:
         if response:
             return bytes(response['data'])
         return None
-    
-    def _mit_motion_control(self, position: float, velocity: float, kp: float, kd: float, torque: float):
-        """MIT protocol motion control - matches C++ implementation exactly"""
-        can_id = self.can_id
-        
-        # Encode parameters - exactly matching C++ float_to_uint calls
-        pos_encoded = float_to_uint(position, P_MIN, P_MAX, 16)
-        vel_encoded = float_to_uint(velocity, V_MIN, V_MAX, 12)
-        kp_encoded = float_to_uint(kp, KP_MIN, KP_MAX, 12)
-        kd_encoded = float_to_uint(kd, KD_MIN, KD_MAX, 12)
-        torque_encoded = float_to_uint(torque, T_MIN, T_MAX, 12)
-        
-        # Data packing exactly matching C++ implementation
-        data = [
-            (pos_encoded >> 8) & 0xFF,  # txdata[0]
-            pos_encoded & 0xFF,         # txdata[1]
-            (vel_encoded >> 4) & 0xFF,  # txdata[2] = vel>>4
-            ((vel_encoded & 0x0F) << 4) | ((kp_encoded >> 8) & 0x0F),  # txdata[3] = vel<<4 | kp>>8
-            kp_encoded & 0xFF,          # txdata[4] = kp&0xFF
-            (kd_encoded >> 4) & 0xFF,   # txdata[5] = kd>>4
-            ((kd_encoded & 0x0F) << 4) | ((torque_encoded >> 8) & 0x0F),  # txdata[6] = kd<<4 | torque>>8
-            torque_encoded & 0xFF       # txdata[7] = torque&0xFF
-        ]
-        
-        self._send_can_message(can_id, data, False)
     
     def _private_motion_control(self, position: float, velocity: float, kp: float, kd: float, torque: float):
         """Private protocol motion control"""
@@ -455,10 +343,7 @@ class RobStrideMotor:
     def _on_can_message(self, can_id: int, data: list, is_extended: bool):
         """Handle received CAN message"""
         try:
-            if self.protocol == ProtocolType.MIT:
-                self._parse_mit_feedback(can_id, data, is_extended)
-            else:
-                self._parse_private_feedback(can_id, data, is_extended)
+            self._parse_private_feedback(can_id, data, is_extended)
         except Exception as e:
             logger.error(f"Error parsing CAN message: {e}")
     
@@ -492,21 +377,6 @@ class RobStrideMotor:
             if self._waiting_for_response:
                 self._last_response = {'can_id': can_id, 'data': data}
                 self._waiting_for_response = False
-    
-    def _parse_mit_feedback(self, can_id: int, data: list, is_extended: bool):
-        """Parse MIT protocol feedback"""
-        if is_extended:
-            return
-        
-        if (can_id & 0xFF) == 0xFD:  # MIT status feedback
-            if all(d == 0x00 for d in data[3:8]):  # Error feedback
-                fault16 = (data[2] << 8) | data[1]
-                self.error_code = map_faults(fault16)
-            else:  # Normal status feedback
-                self.position = uint16_to_float((data[1] << 8) | data[2], P_MIN, P_MAX, 16)
-                self.velocity = uint16_to_float((data[3] << 4) | (data[4] >> 4), V_MIN, V_MAX, 12)
-                self.torque = uint16_to_float((data[4] << 8) | data[5], T_MIN, T_MAX, 12)
-                self.temperature = ((data[6] << 8) | data[7]) * 0.1
     
     def _parse_parameter_response(self, response: dict, address: int) -> Union[int, float]:
         """Parse parameter response"""

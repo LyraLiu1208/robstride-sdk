@@ -3,7 +3,6 @@ Utility functions for RobStride motor communication.
 """
 
 import struct
-from .protocol import P_MIN, P_MAX, V_MIN, V_MAX, KP_MIN, KP_MAX, KD_MIN, KD_MAX, T_MIN, T_MAX
 
 def float_to_uint(x, x_min, x_max, bits):
     """
@@ -73,33 +72,6 @@ def float_to_bytes(value):
         List of 4 bytes
     """
     return list(struct.pack('<f', value))
-
-def map_faults(fault16):
-    """
-    Map MIT 16-bit error code to private protocol 8-bit error code.
-    
-    Args:
-        fault16: 16-bit MIT error code
-        
-    Returns:
-        8-bit private protocol error code
-    """
-    fault8 = 0
-    
-    if fault16 & (1 << 14):  # Overload protection
-        fault8 |= (1 << 4)
-    if fault16 & (1 << 7):   # Not calibrated
-        fault8 |= (1 << 5)
-    if fault16 & (1 << 3):   # Encoder error
-        fault8 |= (1 << 3)
-    if fault16 & (1 << 2):   # Under voltage protection
-        fault8 |= (1 << 0)
-    if fault16 & (1 << 1):   # Over current protection
-        fault8 |= (1 << 1)
-    if fault16 & (1 << 0):   # Locked rotor
-        fault8 |= (1 << 2)
-    
-    return fault8
 
 def validate_parameter_range(param_name, value, min_val, max_val):
     """
